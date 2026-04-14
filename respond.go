@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"syscall"
 )
@@ -15,10 +16,41 @@ type ResponseConfig struct {
 	KillReaders       bool
 	AlertLog          string // path to forensic log file ("" = disabled)
 	LockScreen        bool
+	Tarpit            bool
 }
 
 func (r ResponseConfig) anyEnabled() bool {
 	return r.DisconnectNetwork || r.KillReaders || r.AlertLog != "" || r.LockScreen
+}
+
+// buildPlainSummary creates a human-readable summary of what happened and what
+// canary did about it. Used in both the alert log and the lockscreen overlay.
+func buildPlainSummary(al Alert, trees []string, actions []string) string {
+	var b strings.Builder
+	b.WriteString("One of your canary files was just accessed.\n\n")
+	fmt.Fprintf(&b, "File: %s%s\n", al.Mount, al.Path)
+	fmt.Fprintf(&b, "Time: %s\n", al.Time.Format("2006-01-02 3:04:05 PM"))
+
+	if len(trees) > 0 {
+		b.WriteString("\nProcess tree:\n")
+		for _, t := range trees {
+			// Each tree is already multi-line with indentation; indent the whole block
+			for _, line := range strings.Split(t, "\n") {
+				fmt.Fprintf(&b, "  %s\n", line)
+			}
+		}
+	} else {
+		b.WriteString("\nProcess: could not be identified\n")
+	}
+
+	if len(actions) > 0 {
+		b.WriteString("\nActions taken:\n")
+		for _, a := range actions {
+			fmt.Fprintf(&b, "  - %s\n", a)
+		}
+	}
+
+	return b.String()
 }
 
 // --- Action 1: Disconnect networking ---
@@ -59,15 +91,36 @@ func respondDisconnectNetwork() {
 
 // boundaryProcesses are process names we don't want to kill — they represent
 // the user's session boundary. We kill the process just below these.
+// boundaryProcesses are processes we never kill — they represent session
+// infrastructure above the shell. We kill the process just below these,
+// which is typically the shell itself (ending the attacker's session).
 var boundaryProcesses = map[string]bool{
+	// System / session infrastructure
 	"launchd":     true,
 	"loginwindow": true,
 	"sshd":        true,
-	"Terminal":    true,
-	"iTerm2":      true,
-	"iTerm":       true,
-	"tmux":        true,
-	"screen":      true,
+	// Terminal emulators
+	"Terminal": true,
+	"iTerm2":   true,
+	"iTerm":    true,
+	// Terminal multiplexers
+	"tmux":   true,
+	"screen": true,
+	// Login helpers
+	"login": true,
+}
+
+// isBoundaryProcess checks both the short name and the full path's basename.
+func isBoundaryProcess(name string) bool {
+	if boundaryProcesses[name] {
+		return true
+	}
+	// Full path: "/usr/bin/login" → check "login"
+	base := path.Base(name)
+	if boundaryProcesses[base] {
+		return true
+	}
+	return false
 }
 
 // findKillTarget walks up from readerPID to find the right process to kill.
@@ -95,7 +148,7 @@ func findKillTarget(readerPID int) (targetPID int, targetName string, chain stri
 			break
 		}
 		chainParts = append(chainParts, fmt.Sprintf("%s(%d)", parentName, ppid))
-		if boundaryProcesses[parentName] {
+		if isBoundaryProcess(parentName) {
 			return prev, prevName, strings.Join(chainParts, " → ")
 		}
 		prev = ppid
@@ -106,13 +159,16 @@ func findKillTarget(readerPID int) (targetPID int, targetName string, chain stri
 	return readerPID, prevName, strings.Join(chainParts, " → ")
 }
 
-func respondKillReaders(al Alert, pids []int) {
+// respondKillReaders kills the identified reader processes and returns a
+// human-readable description of what was killed for use in the actions summary.
+func respondKillReaders(al Alert, pids []int) string {
 	if len(pids) == 0 {
 		log.Printf("[kill] no reader PIDs identified for %s%s", al.Mount, al.Path)
-		return
+		return ""
 	}
 
 	killed := map[int]bool{}
+	var descriptions []string
 	for _, pid := range pids {
 		target, name, chain := findKillTarget(pid)
 		if killed[target] {
@@ -124,15 +180,34 @@ func respondKillReaders(al Alert, pids []int) {
 			log.Printf("[kill] kill %d failed: %v", target, err)
 		} else {
 			log.Printf("[kill] killed %s(%d)", name, target)
+			readerName := strings.TrimSpace(psField(pid, "comm"))
+			if readerName == "" {
+				readerName = "unknown"
+			}
+			if target == pid {
+				descriptions = append(descriptions, fmt.Sprintf("Killed the process reading this file: %s (PID %d).", readerName, pid))
+			} else {
+				descriptions = append(descriptions, fmt.Sprintf("Killed the process reading this file (%s, PID %d) and its parents, up to and including %s (PID %d).", readerName, pid, name, target))
+			}
 		}
 		killed[target] = true
 	}
+	return strings.Join(descriptions, " ")
 }
 
 // --- Action 3: Forensic alert log ---
 
-func respondAlertLog(al Alert, lsofOut string, trees []string, logPath string) {
-	entry := formatAlertEntry(al, lsofOut, trees)
+func respondAlertLog(al Alert, lsofOut string, trees []string, actions []string, logPath string) {
+	summary := buildPlainSummary(al, trees, actions)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n========================================\n")
+	b.WriteString(summary)
+	if lsofOut != "" {
+		fmt.Fprintf(&b, "\nRaw lsof output:\n%s\n", lsofOut)
+	}
+	fmt.Fprintf(&b, "========================================\n")
+	entry := b.String()
 
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
@@ -145,25 +220,6 @@ func respondAlertLog(al Alert, lsofOut string, trees []string, logPath string) {
 
 	// Copy to clipboard
 	copyToClipboard(entry)
-}
-
-func formatAlertEntry(al Alert, lsofOut string, trees []string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "\n=== CANARY ALERT %s ===\n", al.Time.Format("2006-01-02T15:04:05Z07:00"))
-	fmt.Fprintf(&b, "Severity:  %s\n", al.Severity)
-	fmt.Fprintf(&b, "Operation: %s\n", al.Operation)
-	fmt.Fprintf(&b, "File:      %s%s\n", al.Mount, al.Path)
-	if len(trees) > 0 {
-		b.WriteString("\nProcess Tree:\n")
-		for _, t := range trees {
-			fmt.Fprintf(&b, "  %s\n", t)
-		}
-	}
-	if lsofOut != "" {
-		fmt.Fprintf(&b, "\nlsof output:\n%s\n", lsofOut)
-	}
-	b.WriteString("==========================================\n")
-	return b.String()
 }
 
 func copyToClipboard(text string) {
@@ -183,11 +239,9 @@ func copyToClipboard(text string) {
 
 // --- Action 4: Full-screen lockscreen overlay ---
 
-func respondLockScreen(al Alert, trees []string) {
-	treeStr := "(process identification unavailable)"
-	if len(trees) > 0 {
-		treeStr = strings.Join(trees, "\n    ")
-	}
+func respondLockScreen(al Alert, trees []string, actions []string) *os.Process {
+	summary := buildPlainSummary(al, trees, actions)
+	message := summary + "\nClick Dismiss to close this alert."
 
 	// Build the JXA (JavaScript for Automation) script that creates a
 	// full-screen NSWindow via the ObjC bridge. This uses only osascript
@@ -220,22 +274,26 @@ var message = %q;
 var label = $.NSTextField.wrappingLabelWithString(message);
 label.setTextColor($.NSColor.whiteColor);
 label.setFont($.NSFont.monospacedSystemFontOfSizeWeight(20, 0.7));
-label.setAlignment($.NSTextAlignmentCenter);
+label.setAlignment($.NSTextAlignmentLeft);
 label.setBackgroundColor($.NSColor.clearColor);
 label.setBezeled(false);
 label.setEditable(false);
 label.setFrame({
-    origin: { x: 40, y: frame.size.height * 0.25 },
-    size: { width: frame.size.width - 80, height: frame.size.height * 0.6 }
+    origin: { x: 80, y: frame.size.height * 0.2 },
+    size: { width: frame.size.width - 160, height: frame.size.height * 0.65 }
 });
 view.addSubview(label);
 
+var buttonY = frame.size.height * 0.2 - 60;
 var button = $.NSButton.alloc.initWithFrame({
-    origin: { x: frame.size.width/2 - 120, y: 60 },
-    size: { width: 240, height: 44 }
+    origin: { x: 80, y: buttonY },
+    size: { width: 280, height: 44 }
 });
 button.setTitle("Dismiss (I understand)");
-button.setBezelStyle($.NSBezelStyleRounded);
+button.setBezelStyle($.NSBezelStyleRegularSquare);
+button.setBordered(false);
+button.setFont($.NSFont.systemFontOfSizeWeight(16, 0.5));
+button.setContentTintColor($.NSColor.whiteColor);
 button.setTarget(app);
 button.setAction("terminate:");
 view.addSubview(button);
@@ -243,24 +301,28 @@ view.addSubview(button);
 window.makeKeyAndOrderFront(null);
 app.activateIgnoringOtherApps(true);
 app.run();
-`,
-		fmt.Sprintf("CANARY ALERT\n\nA honeypot file was accessed!\n\nSeverity:  %s\nOperation: %s\nFile:      %s%s\n\nProcess tree:\n    %s\n\nClick Dismiss to continue.",
-			al.Severity, al.Operation, al.Mount, al.Path, treeStr),
-	)
+`, message)
 
-	runAsConsoleUser("osascript", "-l", "JavaScript", "-e", script)
+	return startAsConsoleUser("osascript", "-l", "JavaScript", "-e", script)
 }
 
-// runAsConsoleUser runs a command as the GUI user (needed when running as root).
-func runAsConsoleUser(name string, args ...string) {
+// startAsConsoleUser starts a command as the GUI user (needed when running as root).
+// Returns the process so the caller can track whether it's still alive.
+func startAsConsoleUser(name string, args ...string) *os.Process {
+	var cmd *exec.Cmd
 	if os.Getuid() == 0 {
 		user := consoleUser()
 		if user == "" || user == "root" {
-			return
+			return nil
 		}
 		sudoArgs := append([]string{"-u", user, name}, args...)
-		exec.Command("sudo", sudoArgs...).Run()
+		cmd = exec.Command("sudo", sudoArgs...)
 	} else {
-		exec.Command(name, args...).Run()
+		cmd = exec.Command(name, args...)
 	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("[lockscreen] failed to start: %v", err)
+		return nil
+	}
+	return cmd.Process
 }

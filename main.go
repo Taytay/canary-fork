@@ -24,8 +24,8 @@ func main() {
 
 	// Response actions
 	disconnectNetwork := flag.Bool("disconnect-network", false, "on alert, disable all network interfaces (requires root)")
-	killReaders := flag.Bool("kill-readers", false, "on alert, kill the process tree reading the canary file")
-	alertLog := flag.String("alert-log", "", "on alert, append forensic details to this file and copy to clipboard")
+	killReaders := flag.Bool("kill-reader-processes", true, "on alert, kill the shell/process tree reading the canary file")
+	alertLog := flag.String("alert-log", "", "path for forensic alert log (default: ~/Desktop/canary-alert.log)")
 	lockScreen := flag.Bool("lockscreen", false, "on alert, show a full-screen warning overlay")
 
 	flag.Usage = func() {
@@ -69,6 +69,11 @@ func main() {
 		}
 	}
 
+	// Default alert-log to ~/Desktop/canary-alert.log
+	if *alertLog == "" {
+		*alertLog = filepath.Join(home, "Desktop", "canary-alert.txt")
+	}
+
 	tree := DefaultTree()
 
 	resp := ResponseConfig{
@@ -76,6 +81,7 @@ func main() {
 		KillReaders:       *killReaders,
 		AlertLog:          *alertLog,
 		LockScreen:        *lockScreen,
+		Tarpit:            *tarpit,
 	}
 
 	if *disconnectNetwork && os.Getuid() != 0 {

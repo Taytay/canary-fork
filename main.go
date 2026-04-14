@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -13,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -112,10 +110,9 @@ func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit 
 	waitForSignal()
 
 	log.Println("shutting down...")
+	close(handler.done) // interrupt any active tarpit loops
 	unmountAll(mounted)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
+	server.Close()
 }
 
 func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit bool) {
@@ -157,6 +154,7 @@ func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit boo
 	waitForSignal()
 
 	log.Println("shutting down...")
+	close(nfs.done)
 	unmountAll([]string{mp})
 	listener.Close()
 }

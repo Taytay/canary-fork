@@ -118,6 +118,7 @@ type NFSServer struct {
 	mount   string
 	handles *handleMap
 	tarpit  bool
+	done    chan struct{} // closed on shutdown to interrupt tarpit sleeps
 	readyAt time.Time
 }
 
@@ -128,6 +129,7 @@ func NewNFSServer(tree *VNode, alerter *Alerter, mountPoint string, tarpit bool)
 		mount:   mountPoint,
 		handles: newHandleMap(tree),
 		tarpit:  tarpit,
+		done:    make(chan struct{}),
 		readyAt: time.Now().Add(5 * time.Second),
 	}
 }
@@ -389,7 +391,7 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 		return w.Bytes()
 	}
 
-	if s.ready() {
+	if s.ready() || (s.tarpit && offset == 0) {
 		s.alerter.Alert(Alert{
 			Severity:  node.Severity,
 			Operation: "READ",
@@ -397,10 +399,6 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 			Mount:     s.mount,
 			Message:   fmt.Sprintf("canary file read: %s", nodePath),
 		})
-	}
-
-	if s.tarpit {
-		time.Sleep(tarpitDelay)
 	}
 
 	data := node.Content
@@ -411,8 +409,31 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 		if len(data) > int(count) {
 			data = data[:count]
 		}
-		if s.tarpit && len(data) > tarpitChunk {
-			data = data[:tarpitChunk]
+		if s.tarpit {
+			off := int(offset)
+			if off < tarpitFastBytes {
+				// First read: return only the fast portion
+				if len(data) > tarpitFastBytes-off {
+					data = data[:tarpitFastBytes-off]
+				}
+			} else {
+				// Subsequent reads: 1 byte at a time with escalating delay
+				if len(data) > 1 {
+					data = data[:1]
+				}
+				n := off - tarpitFastBytes
+				delay := tarpitInitialDelay + time.Duration(n)*tarpitDelayStep
+				if delay > tarpitMaxDelay {
+					delay = tarpitMaxDelay
+				}
+				log.Printf("[tarpit] %s%s — dripping byte %d/%d (delay %v)",
+					s.mount, nodePath, off+1, len(node.Content), delay)
+				select {
+				case <-s.done:
+					return nil // shutting down
+				case <-time.After(delay):
+				}
+			}
 		}
 	}
 

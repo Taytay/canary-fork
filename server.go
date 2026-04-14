@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"html"
+	"log"
 	"net/http"
 	"path"
 	"strconv"
@@ -10,18 +11,26 @@ import (
 	"time"
 )
 
-// tarpitChunk is how many bytes to send per drip in tarpit mode.
-const tarpitChunk = 1
+const (
+	// tarpitFastBytes is how many bytes to deliver immediately.
+	// Enough to look real and keep webdavfs happy, but not the whole file.
+	tarpitFastBytes = 16
 
-// tarpitDelay is the pause between each drip.
-const tarpitDelay = 2 * time.Second
+	// After the fast portion, delay starts at tarpitInitialDelay and grows
+	// by tarpitDelayStep per byte, capped at tarpitMaxDelay.
+	// The max must stay under the WebDAV client's idle timeout (~60s).
+	tarpitInitialDelay = 100 * time.Millisecond
+	tarpitDelayStep    = 50 * time.Millisecond
+	tarpitMaxDelay     = 30 * time.Second
+)
 
 type WebDAVHandler struct {
-	trees   []*VNode
-	alerter *Alerter
-	mounts  []string
-	tarpit  bool
-	readyAt time.Time // suppress alerts during mount warmup
+	trees    []*VNode
+	alerter  *Alerter
+	mounts   []string
+	tarpit   bool
+	done    chan struct{} // closed on shutdown to interrupt tarpit loops
+	readyAt time.Time    // suppress alerts during mount warmup
 }
 
 func NewWebDAVHandler(tree *VNode, alerter *Alerter, mounts []string, tarpit bool) *WebDAVHandler {
@@ -34,6 +43,7 @@ func NewWebDAVHandler(tree *VNode, alerter *Alerter, mounts []string, tarpit boo
 		alerter: alerter,
 		mounts:  mounts,
 		tarpit:  tarpit,
+		done:    make(chan struct{}),
 		readyAt: time.Now().Add(3 * time.Second),
 	}
 }
@@ -189,7 +199,7 @@ func (h *WebDAVHandler) handleGet(w http.ResponseWriter, r *http.Request, tree *
 		return
 	}
 
-	if h.ready() {
+	if h.ready() || h.tarpit {
 		h.alerter.Alert(Alert{
 			Severity:  node.Severity,
 			Operation: "READ",
@@ -200,7 +210,7 @@ func (h *WebDAVHandler) handleGet(w http.ResponseWriter, r *http.Request, tree *
 	}
 
 	if h.tarpit && len(node.Content) > 0 && r.Method == "GET" {
-		h.serveTarpit(w, node)
+		h.serveTarpit(w, r, mount, reqPath, node)
 		return
 	}
 
@@ -212,10 +222,11 @@ func (h *WebDAVHandler) handleGet(w http.ResponseWriter, r *http.Request, tree *
 	}
 }
 
-// serveTarpit drips file content extremely slowly, one small chunk at a time.
-// The goal is to trap automated credential scrapers — the content looks real
-// so they keep waiting, but it takes forever to finish.
-func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, node *VNode) {
+// serveTarpit drips file content with an escalating delay. The first
+// tarpitFastBytes arrive instantly so webdavfs and the reader see real data.
+// After that, each byte takes progressively longer — trapping scrapers that
+// keep waiting for the rest of the content.
+func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, r *http.Request, mount, reqPath string, node *VNode) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(node.Content)))
 	w.Header().Set("Last-Modified", node.ModTime.UTC().Format(http.TimeFormat))
@@ -223,26 +234,56 @@ func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, node *VNode) {
 
 	flusher, canFlush := w.(http.Flusher)
 	data := node.Content
-	sent := 0
 
-	for sent < len(data) {
-		end := sent + tarpitChunk
-		if end > len(data) {
-			end = len(data)
-		}
-		_, err := w.Write(data[sent:end])
-		if err != nil {
-			return // client disconnected
+	remaining := len(data) - tarpitFastBytes
+	if remaining < 0 {
+		remaining = 0
+	}
+	log.Printf("[tarpit] %s%s — sending %d bytes fast, then dripping %d bytes slowly",
+		mount, reqPath, tarpitFastBytes, remaining)
+
+	// Send the fast portion immediately
+	fast := tarpitFastBytes
+	if fast > len(data) {
+		fast = len(data)
+	}
+	if fast > 0 {
+		if _, err := w.Write(data[:fast]); err != nil {
+			return
 		}
 		if canFlush {
 			flusher.Flush()
 		}
-		sent = end
-		if sent < len(data) {
-			time.Sleep(tarpitDelay)
+	}
+
+
+	// Drip remaining bytes one at a time, getting slower and slower
+	for i := fast; i < len(data); i++ {
+		delay := tarpitInitialDelay + time.Duration(i-fast)*tarpitDelayStep
+		if delay > tarpitMaxDelay {
+			delay = tarpitMaxDelay
+		}
+		select {
+		case <-h.done:
+			log.Printf("[tarpit] %s%s — interrupted (shutdown), sent %d/%d bytes", mount, reqPath, i, len(data))
+			return
+		case <-time.After(delay):
+		}
+		if _, err := w.Write(data[i : i+1]); err != nil {
+			log.Printf("[tarpit] %s%s — reader disconnected after %d/%d bytes", mount, reqPath, i, len(data))
+			return
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		if (i-fast+1)%10 == 0 {
+			log.Printf("[tarpit] %s%s — dripped %d/%d bytes (delay now %v)",
+				mount, reqPath, i+1, len(data), delay)
 		}
 	}
+	log.Printf("[tarpit] %s%s — reader consumed all %d bytes", mount, reqPath, len(data))
 }
+
 
 func (h *WebDAVHandler) handleWrite(w http.ResponseWriter, mount, reqPath, op string) {
 	if h.ready() {

@@ -391,7 +391,17 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 		return w.Bytes()
 	}
 
-	if s.ready() || (s.tarpit && offset == 0) {
+	if s.tarpit {
+		if offset == 0 {
+			s.alerter.Alert(Alert{
+				Severity:  node.Severity,
+				Operation: "READ",
+				Path:      nodePath,
+				Mount:     s.mount,
+				Message:   fmt.Sprintf("canary file read: %s", nodePath),
+			})
+		}
+	} else if s.ready() {
 		s.alerter.Alert(Alert{
 			Severity:  node.Severity,
 			Operation: "READ",
@@ -426,8 +436,10 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 				if delay > tarpitMaxDelay {
 					delay = tarpitMaxDelay
 				}
-				log.Printf("[tarpit] %s%s — dripping byte %d/%d (delay %v)",
-					s.mount, nodePath, off+1, len(node.Content), delay)
+				if s.alerter.verbose {
+					log.Printf("[tarpit] %s%s — dripping byte %d/%d (delay %v)",
+						s.mount, nodePath, off+1, len(node.Content), delay)
+				}
 				select {
 				case <-s.done:
 					return nil // shutting down

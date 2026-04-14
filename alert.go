@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,12 +74,71 @@ func (a *Alerter) Alert(al Alert) {
 func (a *Alerter) identifyProcess(al Alert) {
 	fullPath := al.Mount + al.Path
 	out, err := exec.Command("lsof", fullPath).CombinedOutput()
-	if err != nil {
+	if err != nil || len(out) == 0 {
 		return
 	}
-	if len(out) > 0 {
-		log.Printf("  lsof %s:\n%s", fullPath, out)
+	log.Printf("  lsof %s:\n%s", fullPath, out)
+
+	// Parse PIDs from lsof output and print process trees
+	pids := parseLsofPIDs(string(out))
+	for _, pid := range pids {
+		tree := processTree(pid)
+		if tree != "" {
+			log.Printf("  process tree: %s", tree)
+		}
 	}
+}
+
+// parseLsofPIDs extracts unique PIDs from lsof output, skipping the header
+// and our own process.
+func parseLsofPIDs(output string) []int {
+	myPID := os.Getpid()
+	seen := map[int]bool{}
+	var pids []int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil || pid == myPID || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// processTree walks from pid up to PID 1, returning a string like:
+//
+//	gcat(66575) → bash(66500) → sshd(66499) → launchd(1)
+func processTree(pid int) string {
+	var chain []string
+	visited := map[int]bool{}
+	for pid > 0 && !visited[pid] {
+		visited[pid] = true
+		comm := strings.TrimSpace(psField(pid, "comm"))
+		if comm == "" {
+			break
+		}
+		chain = append(chain, fmt.Sprintf("%s(%d)", comm, pid))
+		ppidStr := strings.TrimSpace(psField(pid, "ppid"))
+		ppid, err := strconv.Atoi(ppidStr)
+		if err != nil || ppid == pid {
+			break
+		}
+		pid = ppid
+	}
+	return strings.Join(chain, " → ")
+}
+
+func psField(pid int, field string) string {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", field+"=").Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }
 
 // consoleUser returns the currently logged-in GUI user.

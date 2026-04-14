@@ -276,7 +276,7 @@ func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, r *http.Request, moun
 		if canFlush {
 			flusher.Flush()
 		}
-		if (i-fast+1)%10 == 0 {
+		if h.alerter.verbose && (i-fast+1)%10 == 0 {
 			log.Printf("[tarpit] %s%s — dripped %d/%d bytes (delay now %v)",
 				mount, reqPath, i+1, len(data), delay)
 		}

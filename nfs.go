@@ -117,15 +117,17 @@ type NFSServer struct {
 	alerter *Alerter
 	mount   string
 	handles *handleMap
+	tarpit  bool
 	readyAt time.Time
 }
 
-func NewNFSServer(tree *VNode, alerter *Alerter, mountPoint string) *NFSServer {
+func NewNFSServer(tree *VNode, alerter *Alerter, mountPoint string, tarpit bool) *NFSServer {
 	return &NFSServer{
 		tree:    tree,
 		alerter: alerter,
 		mount:   mountPoint,
 		handles: newHandleMap(tree),
+		tarpit:  tarpit,
 		readyAt: time.Now().Add(5 * time.Second),
 	}
 }
@@ -397,6 +399,10 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 		})
 	}
 
+	if s.tarpit {
+		time.Sleep(tarpitDelay)
+	}
+
 	data := node.Content
 	if int(offset) >= len(data) {
 		data = nil
@@ -404,6 +410,9 @@ func (s *NFSServer) nfsRead(r *xdrReader) []byte {
 		data = data[offset:]
 		if len(data) > int(count) {
 			data = data[:count]
+		}
+		if s.tarpit && len(data) > tarpitChunk {
+			data = data[:tarpitChunk]
 		}
 	}
 

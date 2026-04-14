@@ -21,6 +21,7 @@ func main() {
 	port := flag.Int("port", 0, "server port (0 = random)")
 	verbose := flag.Bool("v", false, "verbose logging (show suppressed duplicates)")
 	notify := flag.Bool("notify", true, "send macOS notifications on alerts")
+	tarpit := flag.Bool("tarpit", false, "drip file contents extremely slowly, trapping readers")
 	logFile := flag.String("log", "", "log to file instead of stderr")
 
 	flag.Usage = func() {
@@ -33,6 +34,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  canary ~/.secrets.d\n")
 		fmt.Fprintf(os.Stderr, "  canary ~/.secrets.d ~/.aws-backup ~/credentials\n")
+		fmt.Fprintf(os.Stderr, "  canary -tarpit ~/.secrets.d\n")
 		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -log /var/log/canary.log ~/.secrets.d\n\n")
 		flag.PrintDefaults()
 	}
@@ -67,22 +69,22 @@ func main() {
 
 	switch *mode {
 	case "webdav":
-		runWebDAV(tree, alerter, mounts, *port)
+		runWebDAV(tree, alerter, mounts, *port, *tarpit)
 	case "nfs":
-		runNFS(tree, alerter, mounts, *port)
+		runNFS(tree, alerter, mounts, *port, *tarpit)
 	default:
 		log.Fatalf("unknown mode: %s (use webdav or nfs)", *mode)
 	}
 }
 
-func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int) {
+func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit bool) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 	actualPort := listener.Addr().(*net.TCPAddr).Port
 
-	handler := NewWebDAVHandler(tree, alerter, mounts)
+	handler := NewWebDAVHandler(tree, alerter, mounts, tarpit)
 	server := &http.Server{Handler: handler}
 	go server.Serve(listener)
 
@@ -116,7 +118,7 @@ func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int) {
 	server.Shutdown(ctx)
 }
 
-func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int) {
+func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit bool) {
 	if os.Getuid() != 0 {
 		log.Fatal("nfs mode requires root (mount_nfs needs root).\n" +
 			"Run with: sudo canary -mode nfs ...")
@@ -134,7 +136,7 @@ func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int) {
 	}
 	actualPort := listener.Addr().(*net.TCPAddr).Port
 
-	nfs := NewNFSServer(tree, alerter, mp)
+	nfs := NewNFSServer(tree, alerter, mp, tarpit)
 	go nfs.Serve(listener)
 
 	log.Printf("[nfs] server on 127.0.0.1:%d", actualPort)

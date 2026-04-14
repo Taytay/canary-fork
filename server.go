@@ -10,14 +10,21 @@ import (
 	"time"
 )
 
+// tarpitChunk is how many bytes to send per drip in tarpit mode.
+const tarpitChunk = 1
+
+// tarpitDelay is the pause between each drip.
+const tarpitDelay = 2 * time.Second
+
 type WebDAVHandler struct {
 	trees   []*VNode
 	alerter *Alerter
 	mounts  []string
+	tarpit  bool
 	readyAt time.Time // suppress alerts during mount warmup
 }
 
-func NewWebDAVHandler(tree *VNode, alerter *Alerter, mounts []string) *WebDAVHandler {
+func NewWebDAVHandler(tree *VNode, alerter *Alerter, mounts []string, tarpit bool) *WebDAVHandler {
 	trees := make([]*VNode, len(mounts))
 	for i := range mounts {
 		trees[i] = tree
@@ -26,6 +33,7 @@ func NewWebDAVHandler(tree *VNode, alerter *Alerter, mounts []string) *WebDAVHan
 		trees:   trees,
 		alerter: alerter,
 		mounts:  mounts,
+		tarpit:  tarpit,
 		readyAt: time.Now().Add(3 * time.Second),
 	}
 }
@@ -191,11 +199,48 @@ func (h *WebDAVHandler) handleGet(w http.ResponseWriter, r *http.Request, tree *
 		})
 	}
 
+	if h.tarpit && len(node.Content) > 0 && r.Method == "GET" {
+		h.serveTarpit(w, node)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(node.Content)))
 	w.Header().Set("Last-Modified", node.ModTime.UTC().Format(http.TimeFormat))
 	if r.Method == "GET" {
 		w.Write(node.Content)
+	}
+}
+
+// serveTarpit drips file content extremely slowly, one small chunk at a time.
+// The goal is to trap automated credential scrapers — the content looks real
+// so they keep waiting, but it takes forever to finish.
+func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, node *VNode) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(node.Content)))
+	w.Header().Set("Last-Modified", node.ModTime.UTC().Format(http.TimeFormat))
+	w.WriteHeader(200)
+
+	flusher, canFlush := w.(http.Flusher)
+	data := node.Content
+	sent := 0
+
+	for sent < len(data) {
+		end := sent + tarpitChunk
+		if end > len(data) {
+			end = len(data)
+		}
+		_, err := w.Write(data[sent:end])
+		if err != nil {
+			return // client disconnected
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		sent = end
+		if sent < len(data) {
+			time.Sleep(tarpitDelay)
+		}
 	}
 }
 

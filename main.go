@@ -22,6 +22,12 @@ func main() {
 	tarpit := flag.Bool("tarpit", false, "drip file contents extremely slowly, trapping readers")
 	logFile := flag.String("log", "", "log to file instead of stderr")
 
+	// Response actions
+	disconnectNetwork := flag.Bool("disconnect-network", false, "on alert, disable all network interfaces (requires root)")
+	killReaders := flag.Bool("kill-readers", false, "on alert, kill the process tree reading the canary file")
+	alertLog := flag.String("alert-log", "", "on alert, append forensic details to this file and copy to clipboard")
+	lockScreen := flag.Bool("lockscreen", false, "on alert, show a full-screen warning overlay")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: canary [flags] <mountpoint> [mountpoint...]\n\n")
 		fmt.Fprintf(os.Stderr, "Mount canary filesystems that alert on access.\n\n")
@@ -33,7 +39,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  canary ~/.secrets.d\n")
 		fmt.Fprintf(os.Stderr, "  canary ~/.secrets.d ~/.aws-backup ~/credentials\n")
 		fmt.Fprintf(os.Stderr, "  canary -tarpit ~/.secrets.d\n")
-		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -log /var/log/canary.log ~/.secrets.d\n\n")
+		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -kill-readers -lockscreen ~/.secrets.d\n")
+		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -disconnect-network -alert-log /var/log/canary-alerts.log ~/.secrets.d\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -63,7 +70,19 @@ func main() {
 	}
 
 	tree := DefaultTree()
-	alerter := NewAlerter(*notify, *verbose)
+
+	resp := ResponseConfig{
+		DisconnectNetwork: *disconnectNetwork,
+		KillReaders:       *killReaders,
+		AlertLog:          *alertLog,
+		LockScreen:        *lockScreen,
+	}
+
+	if *disconnectNetwork && os.Getuid() != 0 {
+		log.Println("warning: -disconnect-network requires root; will skip at alert time")
+	}
+
+	alerter := NewAlerter(*notify, *verbose, resp)
 
 	switch *mode {
 	case "webdav":

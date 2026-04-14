@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -23,14 +24,16 @@ type Alert struct {
 type Alerter struct {
 	notify   bool
 	verbose  bool
+	resp     ResponseConfig
 	cooldown map[string]time.Time
 	mu       sync.Mutex
 }
 
-func NewAlerter(notify, verbose bool) *Alerter {
+func NewAlerter(notify, verbose bool, resp ResponseConfig) *Alerter {
 	return &Alerter{
 		notify:   notify,
 		verbose:  verbose,
+		resp:     resp,
 		cooldown: make(map[string]time.Time),
 	}
 }
@@ -60,33 +63,66 @@ func (a *Alerter) Alert(al Alert) {
 	log.Printf("[%s] %s %s%s - %s",
 		al.Severity, al.Operation, al.Mount, al.Path, al.Message)
 
-	// Try to identify accessing process via lsof (best-effort)
-	if al.Severity >= SevWarning {
-		go a.identifyProcess(al)
-	}
-
 	// macOS notification
 	if a.notify && al.Severity >= SevWarning {
 		go macNotify(al)
 	}
+
+	// Process identification + response actions
+	if al.Severity >= SevWarning {
+		go a.identifyAndRespond(al)
+	}
 }
 
-func (a *Alerter) identifyProcess(al Alert) {
-	fullPath := al.Mount + al.Path
-	out, err := exec.Command("lsof", fullPath).CombinedOutput()
-	if err != nil || len(out) == 0 {
-		return
-	}
-	log.Printf("  lsof %s:\n%s", fullPath, out)
+// identifyAndRespond runs lsof to identify the reader, logs the results,
+// then fires any enabled response actions in sequence.
+func (a *Alerter) identifyAndRespond(al Alert) {
+	lsofOut, pids, trees := collectLsof(al)
 
-	// Parse PIDs from lsof output and print process trees
-	pids := parseLsofPIDs(string(out))
-	for _, pid := range pids {
-		tree := processTree(pid)
-		if tree != "" {
-			log.Printf("  process tree: %s", tree)
+	// Log lsof output and process trees (existing behavior)
+	if lsofOut != "" {
+		log.Printf("  lsof %s%s:\n%s", al.Mount, al.Path, lsofOut)
+		for _, t := range trees {
+			log.Printf("  process tree: %s", t)
 		}
 	}
+
+	// Response actions — sequenced: kill, disconnect, log, lockscreen
+	if a.resp.KillReaders {
+		respondKillReaders(al, pids)
+	}
+	if a.resp.DisconnectNetwork {
+		respondDisconnectNetwork()
+	}
+	if a.resp.AlertLog != "" {
+		respondAlertLog(al, lsofOut, trees, a.resp.AlertLog)
+	}
+	if a.resp.LockScreen {
+		respondLockScreen(al, trees)
+	}
+}
+
+// collectLsof runs lsof on the alert's file path with a timeout to avoid
+// deadlocking on WebDAV mounts. Returns the raw output, parsed PIDs, and
+// formatted process trees.
+func collectLsof(al Alert) (output string, pids []int, trees []string) {
+	fullPath := al.Mount + al.Path
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "lsof", fullPath).CombinedOutput()
+	if err != nil || len(out) == 0 {
+		return "", nil, nil
+	}
+
+	output = string(out)
+	pids = parseLsofPIDs(output)
+	for _, pid := range pids {
+		if t := processTree(pid); t != "" {
+			trees = append(trees, t)
+		}
+	}
+	return output, pids, trees
 }
 
 // parseLsofPIDs extracts unique PIDs from lsof output, skipping the header

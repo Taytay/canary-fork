@@ -55,36 +55,74 @@ func buildPlainSummary(al Alert, trees []string, actions []string) string {
 
 // --- Action 1: Disconnect networking ---
 
+// networkDisconnected tracks whether we've disabled networking so we can
+// re-enable it on shutdown.
+var networkDisconnected bool
+
+// wifiInterfaces finds all Wi-Fi hardware ports (usually just en0, but
+// some Macs have additional Wi-Fi adapters).
+func wifiInterfaces() []string {
+	out, err := exec.Command("networksetup", "-listallhardwareports").CombinedOutput()
+	if err != nil {
+		return []string{"en0"} // fallback
+	}
+	var ifaces []string
+	var nextIsDevice bool
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Hardware Port:") && strings.Contains(line, "Wi-Fi") {
+			nextIsDevice = true
+			continue
+		}
+		if nextIsDevice && strings.HasPrefix(line, "Device:") {
+			dev := strings.TrimSpace(strings.TrimPrefix(line, "Device:"))
+			if dev != "" {
+				ifaces = append(ifaces, dev)
+			}
+			nextIsDevice = false
+		}
+	}
+	if len(ifaces) == 0 {
+		return []string{"en0"}
+	}
+	return ifaces
+}
+
+// respondDisconnectNetwork turns off Wi-Fi power on all Wi-Fi interfaces.
+// This is intentionally user-recoverable: the user can re-enable Wi-Fi from
+// the menu bar icon or System Settings without admin credentials. We avoid
+// `networksetup -setnetworkserviceenabled off` because that greys out the UI
+// toggle and requires admin to reverse.
 func respondDisconnectNetwork() {
 	if os.Getuid() != 0 {
 		log.Printf("[disconnect] skipping: requires root")
 		return
 	}
-
-	// Disable Wi-Fi specifically
-	if out, err := exec.Command("networksetup", "-setairportpower", "en0", "off").CombinedOutput(); err != nil {
-		log.Printf("[disconnect] Wi-Fi off failed: %v %s", err, out)
-	} else {
-		log.Printf("[disconnect] Wi-Fi disabled (en0)")
+	for _, iface := range wifiInterfaces() {
+		if out, err := exec.Command("networksetup", "-setairportpower", iface, "off").CombinedOutput(); err != nil {
+			log.Printf("[disconnect] Wi-Fi off failed (%s): %v %s", iface, err, out)
+		} else {
+			log.Printf("[disconnect] Wi-Fi disabled (%s)", iface)
+		}
 	}
+	networkDisconnected = true
+}
 
-	// Disable all network services
-	out, err := exec.Command("networksetup", "-listallnetworkservices").CombinedOutput()
-	if err != nil {
-		log.Printf("[disconnect] list services failed: %v", err)
+// respondReconnectNetwork re-enables Wi-Fi power. Called on shutdown to
+// restore connectivity after a disconnect response.
+func respondReconnectNetwork() {
+	if !networkDisconnected {
 		return
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "An asterisk") {
-			continue
-		}
-		if out, err := exec.Command("networksetup", "-setnetworkserviceenabled", line, "off").CombinedOutput(); err != nil {
-			log.Printf("[disconnect] disable %q failed: %v %s", line, err, out)
+	log.Println("[reconnect] re-enabling Wi-Fi...")
+	for _, iface := range wifiInterfaces() {
+		if out, err := exec.Command("networksetup", "-setairportpower", iface, "on").CombinedOutput(); err != nil {
+			log.Printf("[reconnect] Wi-Fi on failed (%s): %v %s", iface, err, out)
 		} else {
-			log.Printf("[disconnect] disabled: %s", line)
+			log.Printf("[reconnect] Wi-Fi re-enabled (%s)", iface)
 		}
 	}
+	networkDisconnected = false
 }
 
 // --- Action 2: Kill reader processes ---

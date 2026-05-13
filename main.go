@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -69,9 +70,10 @@ func main() {
 		}
 	}
 
-	// Default alert-log to ~/Desktop/canary-alert.log
+	// Default alert-log to ~/Desktop/canary-alert-<timestamp>.txt
 	if *alertLog == "" {
-		*alertLog = filepath.Join(home, "Desktop", "canary-alert.txt")
+		ts := time.Now().Format("2006-01-02-150405")
+		*alertLog = filepath.Join(home, "Desktop", fmt.Sprintf("canary-alert-%s.txt", ts))
 	}
 
 	tree := DefaultTree()
@@ -135,6 +137,7 @@ func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit 
 	waitForSignal()
 
 	log.Println("shutting down...")
+	respondReconnectNetwork()
 	close(handler.done) // interrupt any active tarpit loops
 	unmountAll(mounted)
 	server.Close()
@@ -179,6 +182,7 @@ func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit boo
 	waitForSignal()
 
 	log.Println("shutting down...")
+	respondReconnectNetwork()
 	close(nfs.done)
 	unmountAll([]string{mp})
 	listener.Close()

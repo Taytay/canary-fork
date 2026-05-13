@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -26,7 +25,7 @@ func main() {
 	// Response actions
 	disconnectNetwork := flag.Bool("disconnect-network", false, "on alert, disable all network interfaces (requires root)")
 	killReaders := flag.Bool("kill-reader-processes", true, "on alert, kill the shell/process tree reading the canary file")
-	alertLog := flag.String("alert-log", "", "path for forensic alert log (default: ~/Desktop/canary-alert.log)")
+	alertLog := flag.String("alert-log", "", "path for forensic alert log (\"\" = disabled)")
 	lockScreen := flag.Bool("lockscreen", false, "on alert, show a full-screen warning overlay")
 
 	flag.Usage = func() {
@@ -68,12 +67,6 @@ func main() {
 		if strings.HasPrefix(m, "~/") {
 			mounts[i] = filepath.Join(home, m[2:])
 		}
-	}
-
-	// Default alert-log to ~/Desktop/canary-alert-<timestamp>.txt
-	if *alertLog == "" {
-		ts := time.Now().Format("2006-01-02-150405")
-		*alertLog = filepath.Join(home, "Desktop", fmt.Sprintf("canary-alert-%s.txt", ts))
 	}
 
 	tree := DefaultTree()

@@ -199,7 +199,7 @@ func (h *WebDAVHandler) handleGet(w http.ResponseWriter, r *http.Request, tree *
 		return
 	}
 
-	if h.ready() || h.tarpit {
+	if h.ready() {
 		h.alerter.Alert(Alert{
 			Severity:  node.Severity,
 			Operation: "READ",

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -13,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -21,7 +19,14 @@ func main() {
 	port := flag.Int("port", 0, "server port (0 = random)")
 	verbose := flag.Bool("v", false, "verbose logging (show suppressed duplicates)")
 	notify := flag.Bool("notify", true, "send macOS notifications on alerts")
+	tarpit := flag.Bool("tarpit", false, "drip file contents extremely slowly, trapping readers")
 	logFile := flag.String("log", "", "log to file instead of stderr")
+
+	// Response actions
+	disconnectNetwork := flag.Bool("disconnect-network", false, "on alert, disable all network interfaces (requires root)")
+	killReaders := flag.Bool("kill-reader-processes", true, "on alert, kill the shell/process tree reading the canary file")
+	alertLog := flag.String("alert-log", "", "path for forensic alert log (\"\" = disabled)")
+	lockScreen := flag.Bool("lockscreen", false, "on alert, show a full-screen warning overlay")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: canary [flags] <mountpoint> [mountpoint...]\n\n")
@@ -33,7 +38,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  canary ~/.secrets.d\n")
 		fmt.Fprintf(os.Stderr, "  canary ~/.secrets.d ~/.aws-backup ~/credentials\n")
-		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -log /var/log/canary.log ~/.secrets.d\n\n")
+		fmt.Fprintf(os.Stderr, "  canary -tarpit ~/.secrets.d\n")
+		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -kill-readers -lockscreen ~/.secrets.d\n")
+		fmt.Fprintf(os.Stderr, "  sudo canary -mode nfs -disconnect-network -alert-log /var/log/canary-alerts.log ~/.secrets.d\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -63,26 +70,39 @@ func main() {
 	}
 
 	tree := DefaultTree()
-	alerter := NewAlerter(*notify, *verbose)
+
+	resp := ResponseConfig{
+		DisconnectNetwork: *disconnectNetwork,
+		KillReaders:       *killReaders,
+		AlertLog:          *alertLog,
+		LockScreen:        *lockScreen,
+		Tarpit:            *tarpit,
+	}
+
+	if *disconnectNetwork && os.Getuid() != 0 {
+		log.Println("warning: -disconnect-network requires root; will skip at alert time")
+	}
+
+	alerter := NewAlerter(*notify, *verbose, resp)
 
 	switch *mode {
 	case "webdav":
-		runWebDAV(tree, alerter, mounts, *port)
+		runWebDAV(tree, alerter, mounts, *port, *tarpit)
 	case "nfs":
-		runNFS(tree, alerter, mounts, *port)
+		runNFS(tree, alerter, mounts, *port, *tarpit)
 	default:
 		log.Fatalf("unknown mode: %s (use webdav or nfs)", *mode)
 	}
 }
 
-func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int) {
+func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit bool) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 	actualPort := listener.Addr().(*net.TCPAddr).Port
 
-	handler := NewWebDAVHandler(tree, alerter, mounts)
+	handler := NewWebDAVHandler(tree, alerter, mounts, tarpit)
 	server := &http.Server{Handler: handler}
 	go server.Serve(listener)
 
@@ -110,13 +130,13 @@ func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int) {
 	waitForSignal()
 
 	log.Println("shutting down...")
+	respondReconnectNetwork()
+	close(handler.done) // interrupt any active tarpit loops
 	unmountAll(mounted)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
+	server.Close()
 }
 
-func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int) {
+func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit bool) {
 	if os.Getuid() != 0 {
 		log.Fatal("nfs mode requires root (mount_nfs needs root).\n" +
 			"Run with: sudo canary -mode nfs ...")
@@ -134,7 +154,7 @@ func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int) {
 	}
 	actualPort := listener.Addr().(*net.TCPAddr).Port
 
-	nfs := NewNFSServer(tree, alerter, mp)
+	nfs := NewNFSServer(tree, alerter, mp, tarpit)
 	go nfs.Serve(listener)
 
 	log.Printf("[nfs] server on 127.0.0.1:%d", actualPort)
@@ -155,6 +175,8 @@ func runNFS(tree *VNode, alerter *Alerter, mounts []string, port int) {
 	waitForSignal()
 
 	log.Println("shutting down...")
+	respondReconnectNetwork()
+	close(nfs.done)
 	unmountAll([]string{mp})
 	listener.Close()
 }

@@ -127,8 +127,6 @@ func respondReconnectNetwork() {
 
 // --- Action 2: Kill reader processes ---
 
-// boundaryProcesses are process names we don't want to kill — they represent
-// the user's session boundary. We kill the process just below these.
 // boundaryProcesses are processes we never kill — they represent session
 // infrastructure above the shell. We kill the process just below these,
 // which is typically the shell itself (ending the attacker's session).
@@ -225,7 +223,7 @@ func respondKillReaders(al Alert, pids []int) string {
 			if target == pid {
 				descriptions = append(descriptions, fmt.Sprintf("Killed the process reading this file: %s (PID %d).", readerName, pid))
 			} else {
-				descriptions = append(descriptions, fmt.Sprintf("Killed the process reading this file (%s, PID %d) and its parents, up to and including %s (PID %d).", readerName, pid, name, target))
+				descriptions = append(descriptions, fmt.Sprintf("Killed the session process %s (PID %d), which had launched the file reader %s (PID %d).", name, target, readerName, pid))
 			}
 		}
 		killed[target] = true
@@ -252,8 +250,11 @@ func respondAlertLog(al Alert, lsofOut string, trees []string, actions []string,
 		log.Printf("[alert-log] write failed: %v", err)
 		return
 	}
-	f.WriteString(entry)
-	f.Close()
+	defer f.Close()
+	if _, err := f.WriteString(entry); err != nil {
+		log.Printf("[alert-log] write error: %v", err)
+		return
+	}
 	log.Printf("[alert-log] written to %s", logPath)
 
 	// Copy to clipboard
@@ -299,7 +300,7 @@ var window = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(
     $.NSBackingStoreBuffered,
     false
 );
-window.setLevel(25);  // above screenSaver level
+window.setLevel(25);  // NSStatusWindowLevel — above normal windows and menu bar
 window.setCollectionBehavior($.NSWindowCollectionBehaviorCanJoinAllSpaces);
 window.setOpaque(true);
 window.setBackgroundColor($.NSColor.colorWithRedGreenBlueAlpha(0.6, 0.0, 0.0, 1.0));

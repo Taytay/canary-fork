@@ -107,6 +107,7 @@ func runWebDAV(tree *VNode, alerter *Alerter, mounts []string, port int, tarpit 
 	go server.Serve(listener)
 
 	log.Printf("[webdav] server on 127.0.0.1:%d", actualPort)
+	log.Println("tip: if macOS prompts for Keychain access (webdavfs_agent), click \"Always Allow\" — it won't ask again")
 
 	var mounted []string
 	for i, mp := range mounts {

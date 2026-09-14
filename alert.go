@@ -23,13 +23,14 @@ type Alert struct {
 }
 
 type Alerter struct {
-	notify        bool
-	verbose       bool
-	resp          ResponseConfig
-	cooldown      map[string]time.Time
-	mu            sync.Mutex
-	lockScreenProc *os.Process // non-nil while lockscreen osascript is alive
-	lockScreenMu   sync.Mutex
+	notify             bool
+	verbose            bool
+	resp               ResponseConfig
+	cooldown           map[string]time.Time
+	mu                 sync.Mutex
+	lockScreenProc     *os.Process // non-nil while lockscreen osascript is alive
+	lockScreenSpawning bool        // true while respondLockScreen is running
+	lockScreenMu       sync.Mutex
 }
 
 func NewAlerter(notify, verbose bool, resp ResponseConfig) *Alerter {
@@ -114,22 +115,27 @@ func (a *Alerter) identifyAndRespond(al Alert) {
 	}
 	if a.resp.LockScreen {
 		a.lockScreenMu.Lock()
-		// Check if a previous lockscreen process is still alive
+		// Block if another goroutine is already spawning or if a live screen exists.
+		if a.lockScreenSpawning {
+			a.lockScreenMu.Unlock()
+			log.Printf("[lockscreen] skipping — spawn already in progress")
+			return
+		}
 		if a.lockScreenProc != nil {
-			// Signal 0 checks if process exists without killing it
 			if a.lockScreenProc.Signal(syscall.Signal(0)) == nil {
 				a.lockScreenMu.Unlock()
 				log.Printf("[lockscreen] skipping — already displayed")
 				return
 			}
-			// Process is gone (crashed or dismissed); allow a new one
 			a.lockScreenProc = nil
 		}
+		a.lockScreenSpawning = true
 		a.lockScreenMu.Unlock()
 
 		proc := respondLockScreen(al, trees, actions)
 
 		a.lockScreenMu.Lock()
+		a.lockScreenSpawning = false
 		a.lockScreenProc = proc
 		a.lockScreenMu.Unlock()
 

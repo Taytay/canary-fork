@@ -256,7 +256,6 @@ func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, r *http.Request, moun
 		}
 	}
 
-
 	// Drip remaining bytes one at a time, getting slower and slower
 	for i := fast; i < len(data); i++ {
 		delay := tarpitInitialDelay + time.Duration(i-fast)*tarpitDelayStep
@@ -283,7 +282,6 @@ func (h *WebDAVHandler) serveTarpit(w http.ResponseWriter, r *http.Request, moun
 	}
 	log.Printf("[tarpit] %s%s — reader consumed all %d bytes", mount, reqPath, len(data))
 }
-
 
 func (h *WebDAVHandler) handleWrite(w http.ResponseWriter, mount, reqPath, op string) {
 	if h.ready() {
